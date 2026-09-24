@@ -1,0 +1,172 @@
+name: Attach Release Binaries
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-frontend:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build frontend artifact
+        uses: ./.github/actions/build-frontend
+        with:
+          artifact-name: komari-frontend
+
+  build-and-attach-binaries:
+    needs: build-frontend
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        goos: [windows, linux]
+        goarch: [amd64, arm64, 386, riscv64]
+        include:
+          # Windows
+          - goos: windows
+            goarch: amd64
+            zig_target_triple: x86_64-windows-gnu
+            binary_extension: .exe
+          - goos: windows
+            goarch: arm64
+            zig_target_triple: aarch64-windows-gnu
+            binary_extension: .exe
+          - goos: windows
+            goarch: 386
+            zig_target_triple: x86-windows-gnu
+            binary_extension: .exe
+
+          # Linux
+          - goos: linux
+            goarch: amd64
+            zig_target_triple: x86_64-linux-musl
+            binary_extension: ""
+          - goos: linux
+            goarch: arm64
+            zig_target_triple: aarch64-linux-musl
+            binary_extension: ""
+          - goos: linux
+            goarch: 386
+            zig_target_triple: x86-linux-musl
+            binary_extension: ""
+          - goos: linux
+            goarch: riscv64
+            zig_target_triple: riscv64-linux-musl
+            binary_extension: ""
+
+        exclude:
+          - goos: windows
+            goarch: riscv64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Restore frontend artifact
+        uses: ./.github/actions/restore-frontend
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Install Zig cross-compiler toolchain
+        uses: ./.github/actions/setup-zig
+
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 1
+          CC: zig cc -target ${{ matrix.zig_target_triple }}
+          GIN_MODE: release
+        run: |
+          BINARY_NAME=komari-${{ matrix.goos }}-${{ matrix.goarch }}
+          if [ "${{ matrix.binary_extension }}" != "" ]; then
+            BINARY_NAME=${BINARY_NAME}${{ matrix.binary_extension }}
+          fi
+          VERSION="${{ github.event.release.tag_name }}"
+          VERSION_HASH="${{ github.sha }}" # Use commit SHA for hash
+          go build -trimpath -ldflags="-s -w -X github.com/komari-monitor/komari/utils.CurrentVersion=${VERSION} -X github.com/komari-monitor/komari/utils.VersionHash=${VERSION_HASH}" -o $BINARY_NAME
+
+      - name: Upload binary as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: komari-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: komari-${{ matrix.goos }}-${{ matrix.goarch }}*
+
+      - name: Upload binary to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Define the binary name for upload
+          BINARY_NAME=komari-${{ matrix.goos }}-${{ matrix.goarch }}
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            BINARY_NAME=${BINARY_NAME}.exe
+          fi
+          # Upload the binary as a release asset using GitHub CLI
+          gh release upload ${{ github.event.release.tag_name }} $BINARY_NAME --repo ${{ github.repository }} --clobber
+        shell: bash
+
+  build-and-push-docker:
+    needs: build-and-attach-binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download Docker binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: komari-linux-*
+          path: .
+          merge-multiple: true
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ github.event.release.tag_name }}
+            type=raw,value=latest
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          no-cache: true
+          provenance: false
